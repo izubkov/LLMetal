@@ -1,10 +1,13 @@
-use metal::*;
+use objc2_metal::*;
+use objc2_foundation::NSString;
 use std::mem;
+use std::ptr::NonNull;
+use std::ffi::c_void;
 
 fn main() {
     // Initialize Metal device and command queue
-    let device = Device::system_default().expect("No Metal device found");
-    let command_queue = device.new_command_queue();
+    let device = MTLCreateSystemDefaultDevice().expect("No Metal device found");
+    let command_queue = device.newCommandQueue().expect("Failed to create command queue");
 
     println!("{:?}", device);
 
@@ -14,39 +17,82 @@ fn main() {
     let b = vec![2.0f32; n];
     let mut c = vec![0.0f32; n];
 
-    let a_buffer = device.new_buffer_with_data(a.as_ptr() as *const _, (n * mem::size_of::<f32>()) as u64, MTLResourceOptions::StorageModeShared);
-    let b_buffer = device.new_buffer_with_data(b.as_ptr() as *const _, (n * mem::size_of::<f32>()) as u64, MTLResourceOptions::StorageModeShared);
-    let c_buffer = device.new_buffer_with_data(c.as_mut_ptr() as *mut _, (n * mem::size_of::<f32>()) as u64, MTLResourceOptions::StorageModeShared);
+    let a_id = unsafe {
+        device.newBufferWithBytes_length_options(
+            NonNull::from(&a[0]).cast::<c_void>(),
+            n * mem::size_of::<f32>(),
+            MTLResourceOptions::StorageModeShared,
+        )
+    };
+    let a_buffer = a_id.as_deref();
+    let b_id = unsafe {
+        device.newBufferWithBytes_length_options(
+            NonNull::from(&b[0]).cast::<c_void>(),
+            n * mem::size_of::<f32>(),
+            MTLResourceOptions::StorageModeShared,
+        )
+    };
+    let b_buffer = b_id.as_deref();
+    let c_id = unsafe {
+        device.newBufferWithBytes_length_options(
+            NonNull::from(&mut c[0]).cast::<c_void>(),
+            n * mem::size_of::<f32>(),
+            MTLResourceOptions::StorageModeShared,
+        )
+    };
+    let c_buffer = c_id.as_deref();
 
     // Load Metal shader
-    let source = include_str!("add_vectors.metal");
-    let library = device.new_library_with_source(source, &CompileOptions::new()).unwrap();
-    let kernel = library.get_function("add_vectors", None).unwrap();
-    let pipeline_state = device.new_compute_pipeline_state_with_function(&kernel).unwrap();
+    let source: &'static str = include_str!("add_vectors.metal");
+    let source_nsstring = NSString::from_str(source);
+    let library = device.newLibraryWithSource_options_error(&source_nsstring, None).unwrap();
+    let function_name = NSString::from_str("add_vectors");
+    let kernel = library.newFunctionWithName(&function_name).unwrap();
+    let pipeline_state = device.newComputePipelineStateWithFunction_error(&kernel).unwrap();
 
     // Create command buffer and encoder
-    let command_buffer = command_queue.new_command_buffer();
-    let encoder = command_buffer.new_compute_command_encoder();
-    encoder.set_compute_pipeline_state(&pipeline_state);
-    encoder.set_buffer(0, Some(&a_buffer), 0);
-    encoder.set_buffer(1, Some(&b_buffer), 0);
-    encoder.set_buffer(2, Some(&c_buffer), 0);
+    let command_buffer = command_queue.commandBuffer().expect("Failed to create command buffer");
+    let encoder = command_buffer.computeCommandEncoder().expect("Failed to create encoder");
+    unsafe {
+        encoder.setComputePipelineState(&pipeline_state);
+        encoder.setBuffer_offset_atIndex(a_buffer, 0, 0);
+        encoder.setBuffer_offset_atIndex(b_buffer, 0, 1);
+        encoder.setBuffer_offset_atIndex(c_buffer, 0, 2);
+    }
+    
     // Pass n as bytes directly (more efficient than a buffer)
     let n_u32 = n as u32;
-    encoder.set_bytes(3, mem::size_of::<u32>() as u64, &n_u32 as *const _ as *const _);
+    unsafe {
+        encoder.setBytes_length_atIndex(
+            NonNull::from(&n_u32).cast::<c_void>(),
+            mem::size_of::<u32>(),
+            3,
+        );
+    }
 
     // Dispatch threads
-    let threads_per_group = MTLSize::new(256, 1, 1);
-    let num_threadgroups = MTLSize::new((n as u64 + 255) / 256, 1, 1);
-    encoder.dispatch_thread_groups(num_threadgroups, threads_per_group);
-    encoder.end_encoding();
+    let threads_per_group = MTLSize {
+        width: 256,
+        height: 1,
+        depth: 1,
+    };
+    let num_threadgroups = MTLSize {
+        width: (n + 255) / 256,
+        height: 1,
+        depth: 1,
+    };
+    encoder.dispatchThreadgroups_threadsPerThreadgroup(num_threadgroups, threads_per_group);
+    encoder.endEncoding();
 
     // Commit command buffer
     command_buffer.commit();
-    command_buffer.wait_until_completed();
+    unsafe {
+        command_buffer.waitUntilCompleted();
+    }
 
     // Read results
-    let result_ptr = c_buffer.contents() as *const f32;
+    let result_buffer = c_buffer.expect("Failed to create MTLBuffer");
+    let result_ptr = result_buffer.contents().cast::<f32>().as_ptr();
     let result = unsafe { std::slice::from_raw_parts(result_ptr, n) };
     println!("{:?}", result);
 }
