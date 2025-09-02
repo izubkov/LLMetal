@@ -1,7 +1,7 @@
 #include <metal_stdlib>
 using namespace metal;
 
-kernel void add_vectors(device const float* a [[buffer(0)]],
+kernel void add_two_vectors(device const float* a [[buffer(0)]],
                         device const float* b [[buffer(1)]],
                         device float* c [[buffer(2)]],
                         constant uint& n [[buffer(3)]],

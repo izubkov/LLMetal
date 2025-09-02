@@ -1,0 +1,22 @@
+{
+  "configurations": [
+    {
+      "type": "lldb",
+      "request": "launch",
+      "name": "Debug",
+      "cwd": "${workspaceFolder}",
+      "program": "${workspaceFolder}/target/debug/LLMetal",
+      "env": {
+        "RUST_BACKTRACE": "short",
+        "RUSTC_TOOLCHAIN": "${env.HOME}/.rustup/toolchains/stable-aarch64-apple-darwin"
+      },
+      "args": [
+        "model/devstralQ4_K_M.gguf"
+      ],
+      "sourceMap": {},
+      "sourceLanguages": [
+        "rust"
+      ]
+    }
+  ]
+}
