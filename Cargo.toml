@@ -4,6 +4,8 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-gguf-llms = "0.0.2"
+# gguf-rs = { version = "0.1.4", features = ["debug"] }
+# gguf-rs = { path = "../gguf-rs" }
+gguf-rs = "0.1.4"  
 objc2-foundation = "0.3.1"
 objc2-metal = "0.3.1"

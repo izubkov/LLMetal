@@ -20,3 +20,19 @@ Most workflows involve writing Metal shader code, compiling it to a Metal librar
 ### for speed-up ??
 Adding zerocopy v0.8.26
 Adding zerocopy-derive v0.8.26
+
+**In-memory prompt caching** support so that repeat requests with the exact same prompt do not have to ingest the prompt again. This is a huge speed-up in cases where you’re running a model that is not fully offloaded to the GPU.
+
+# GGUF parser
+
+## Install
+
+```
+mkdir .cargo
+cargo install gguf-rs --root=.cargo
+```
+
+## Usage
+```
+.cargo/bin/gguf model/devstralQ4_K_M.gguf --tensors
+```
