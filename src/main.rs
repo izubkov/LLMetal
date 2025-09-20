@@ -9,9 +9,39 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut container = get_gguf_container(&args[1])?;
     let model = container.decode()?;
+
     println!("Model Family: {}", model.model_family());
     println!("Number of Parameters: {}", model.model_parameters());
     println!("File Type: {}", model.file_type());
     println!("Number of Tensors: {}", model.num_tensor());
+
+    // Load model parameters
+    let vocab_size = model
+        .metadata()
+        .get("tokenizer.ggml.tokens")
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.len())
+        .unwrap_or(0);
+
+    let dim = model
+        .metadata()
+        .get("llama.embedding_length")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0) as usize;
+
+    let n_layers = model
+        .metadata()
+        .get("llama.block_count")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0) as usize;
+
+    let n_heads = model
+        .metadata()
+        .get("llama.attention.head_count")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0) as usize;
+
+    let head_dim = dim / n_heads;
+
     Ok(())
 }

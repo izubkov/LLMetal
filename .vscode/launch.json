@@ -11,7 +11,7 @@
         "RUSTC_TOOLCHAIN": "${env.HOME}/.rustup/toolchains/stable-aarch64-apple-darwin"
       },
       "args": [
-        "model/devstralQ4_K_M.gguf"
+        "../LLMs/devstralQ8_0.gguf"
       ],
       "sourceMap": {},
       "sourceLanguages": [
