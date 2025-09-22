@@ -18,10 +18,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Load model parameters
     let vocab_size = model
         .metadata()
-        .get("tokenizer.ggml.tokens")
-        .and_then(|v| v.as_array())
-        .map(|arr| arr.len())
-        .unwrap_or(0);
+        .get("llama.vocab_size")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0) as usize;
 
     let dim = model
         .metadata()
@@ -38,6 +37,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let n_heads = model
         .metadata()
         .get("llama.attention.head_count")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0) as usize;
+
+    let n_heads_kv = model
+        .metadata()
+        .get("llama.attention.head_count_kv")
         .and_then(|v| v.as_u64())
         .unwrap_or(0) as usize;
 
