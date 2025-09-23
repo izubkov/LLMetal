@@ -1,4 +1,8 @@
-# List of Rust libraries
+# Tokenizers
+
+https://crates.io/crates/tokenizers
+
+# List of Rust libraries for Apple Metal
 
 ```
 https://www.perplexity.ai/search/find-projects-on-github-implem-EKGzg3LlS9S4drc7nho9ew
