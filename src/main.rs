@@ -48,6 +48,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let head_dim = dim / n_heads;
 
+    dbg!(n_layers, n_heads, n_heads_kv, head_dim);
+    dbg!(vocab_size, dim);
+    dbg!(model.metadata());
+
     // Initialize tokenizer
     let tokenizer = DevstralTokenizer::new(vocab_size);
     
