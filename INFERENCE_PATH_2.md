@@ -1,428 +1,451 @@
-# Inference Path Report: Apple Metal Q8 Devstral
+# MistralRS GGUF Inference Path for Apple Metal
 
-This document traces the complete inference path in mistral_rs for Apple Metal devices with Q8 quantized GGUF models.
-
-## Overview
-
-The inference pipeline follows this flow:
-1. **Model Loading**: Load GGUF Q8 quantized model files
-2. **Device Initialization**: Set up Apple Metal device
-3. **Tokenizer Initialization**: Load and configure tokenizer
-4. **Forward Pass**: Execute model forward pass through transformer layers
-5. **Sampling**: Sample next token from logits
-6. **Decoding**: Decode tokens to text output
+This document traces the complete inference path for running a GGUF quantized model (Q8) on Apple Metal using mistral.rs.
 
 ---
 
-## 1. Model Loading (GGUF Q8)
+## 1. Device Initialization
 
-### Entry Point
-**File**: `mistral_rs/mistralrs/src/text_model.rs`
-
-```rust
-TextModelBuilder::new("model_id")
-    .with_isq(IsqType::Q8_0)  // Q8 quantization
-    .build()
-    .await?
-```
-
-### GGUF Loader
-**File**: `mistral_rs/mistralrs-core/src/pipeline/gguf.rs`
-
-The `GGUFLoader` loads quantized model files:
-
-```rust
-impl Loader for GGUFLoader {
-    fn load_model_from_path(
-        &self,
-        paths: &Box<dyn ModelPaths>,
-        dtype: &dyn TryIntoDType,
-        device: &Device,  // Metal device
-        ...
-    ) -> Result<Arc<Mutex<dyn Pipeline + Send + Sync>>>
-```
-
-**Key Steps**:
-- Reads GGUF file headers and metadata
-- Loads Q8 quantized tensors using `candle_core::quantized::ggml_file`
-- Maps tensors to Metal device
-- Creates `GGUFPipeline` with quantized model weights
-
-### Q8 Quantization Support
-**File**: `mistral_rs/mistralrs-quant/src/lib.rs`
-
-```rust
-pub enum IsqType {
-    Q8_0,  // Q8 quantization type
-    Q8_1,
-    ...
-}
-```
-
-**File**: `mistral_rs/mistralrs-quant/src/gguf/mod.rs`
-
-The `GgufMatMul` struct handles Q8 quantized matrix operations:
-
-```rust
-pub struct GgufMatMul {
-    pub(crate) w: QMatMul,  // Quantized matrix multiplication
-    pub(crate) b: Option<Tensor>,
-}
-
-impl QuantMethod for GgufMatMul {
-    fn forward(&self, a: &Tensor) -> Result<Tensor> {
-        let x = self.w.forward(a)?;  // Q8 matmul on Metal
-        ...
-    }
-}
-```
-
----
-
-## 2. Device Initialization (Apple Metal)
-
-### Metal Device Setup
-**File**: `mistral_rs/mistralrs-core/src/lib.rs`
-
-Metal device is initialized when creating the pipeline:
-
-```rust
-#[cfg(feature = "metal")]
-objc::rc::autoreleasepool(move || {
-    // Metal device is automatically selected
-    let device = Device::Metal(...);
-    ...
-})
-```
-
-**File**: `mistral_rs/mistralrs/src/model.rs`
+### Metal Device Creation
+**File:** `mistralrs/src/model.rs:12-24`
 
 ```rust
 pub fn best_device(force_cpu: bool) -> Result<Device> {
     if force_cpu {
-        Ok(Device::Cpu)
-    } else {
-        #[cfg(feature = "metal")]
-        {
-            Device::new_metal(0)  // Get Metal device
+        return Ok(Device::Cpu);
+    }
+    #[cfg(feature = "metal")]
+    {
+        Device::new_metal(0)
+    }
+}
+```
+
+The `best_device()` function automatically selects the Metal device when compiled with the `metal` feature flag.
+
+---
+
+## 2. Model Builder Initialization
+
+### GgufModelBuilder
+**File:** `mistralrs/src/gguf.rs:17-79`
+
+```rust
+pub struct GgufModelBuilder {
+    pub(crate) model_id: String,
+    pub(crate) files: Vec<String>,
+    pub(crate) tok_model_id: Option<String>,
+    pub(crate) device_mapping: Option<DeviceMapSetting>,
+    pub(crate) paged_attn_cfg: Option<PagedAttentionConfig>,
+    pub(crate) max_num_seqs: usize,
+    pub(crate) prefix_cache_n: Option<usize>,
+    // ... more fields
+}
+```
+
+Key defaults:
+- Token source: HuggingFace cache (`~/.cache/huggingface/token`)
+- Max sequences: 32
+- Prefix cache: 16 sequences
+- Device mapping: Auto with text model defaults
+
+---
+
+## 3. GGUF Model Loading
+
+### GGUFLoaderBuilder
+**File:** `mistralrs-core/src/pipeline/gguf.rs:125-216`
+
+```rust
+impl GGUFLoaderBuilder {
+    pub fn new(
+        chat_template: Option<String>,
+        tok_model_id: Option<String>,
+        quantized_model_id: String,
+        quantized_filenames: Vec<String>,
+        config: GGUFSpecificConfig,
+        no_kv_cache: bool,
+        jinja_explicit: Option<String>,
+    ) -> Self
+```
+
+### Content Loading from GGUF Files
+**File:** `mistralrs-core/src/gguf/content.rs:49-110`
+
+```rust
+pub fn from_readers(readers: &'a mut [&'a mut R]) -> Result<Self> {
+    let mut contents = Vec::new();
+    for reader in readers.iter_mut() {
+        contents.push(gguf_file::Content::read(reader)?);
+    }
+    // Detect architecture (llama, phi3, qwen, etc.)
+    let arch = ct.metadata["general.architecture"].to_string()
+        .and_then(GGUFArchitecture::from_value)?;
+    // ...
+}
+```
+
+### Architecture Detection
+**File:** `mistralrs-core/src/gguf/mod.rs:14-32`
+
+Supported architectures for GGUF:
+- `Llama` - Maps to QLlama
+- `Phi2` - Maps to QPhi
+- `Phi3` - Maps to QPhi3
+- `Starcoder2` - Maps to QStarcoder2
+- `Qwen2` - Maps to QQwen
+- `Qwen3` - Maps to QQwen3
+- `Qwen3MoE` - Maps to QQwen3MoE
+
+---
+
+## 4. Tokenizer Initialization
+
+### GGUF Tokenizer Conversion
+**File:** `mistralrs-core/src/gguf/gguf_tokenizer.rs:69-144`
+
+```rust
+pub fn convert_gguf_to_hf_tokenizer<R: std::io::Seek + std::io::Read>(
+    content: &Content<'_, R>,
+) -> Result<GgufTokenizerConversion> {
+    // Extract tokenizer metadata
+    let props = PropsGGUF::try_from(metadata)?;
+    
+    // Build tokenizer based on model type
+    let (mut tokenizer, kind) = match props.model.as_str() {
+        "llama" | "replit" => unigram_tokenizer(&props)?,
+        "gpt2" => bpe_tokenizer(&props)?,
+        _ => bail!("Tokenizer model not supported"),
+    };
+    // ...
+}
+```
+
+---
+
+## 5. Quantized Model Weights Loading
+
+### Model Configuration from GGUF
+**File:** `mistralrs-core/src/models/quantized_llama.rs:398-644`
+
+```rust
+impl ModelConfig::FromGGUF for ModelWeights {
+    fn from_gguf<R: std::io::Seek + std::io::Read>(
+        mut ct: Content<'_, R>,
+        device: &Device,
+        mapper: Box<dyn DeviceMapper + Send + Sync>,
+        attention_mechanism: AttentionImplementation,
+        dtype: DType,
+    ) -> Result<Self> {
+        // Extract model properties
+        let PropsGGUF { head_count, block_count, embedding_length, ... } = ...;
+        
+        // Load embeddings
+        let tok_embeddings = ct.tensor("token_embd.weight", device)?.dequantize(device)?;
+        
+        // Load layers with quantized weights (GgufMatMul)
+        for layer_idx in 0..block_count {
+            let attention_wq = ct.tensor(&format!("{prefix}.attn_q.weight"), device)?;
+            // ... load all layer weights
+            layers.push(LayerWeights { ... });
         }
-        ...
     }
 }
 ```
 
-### Metal Kernels for Quantization
-**File**: `mistral_rs/mistralrs-quant/src/metal_kernels/`
-
-Metal shader kernels handle Q8 operations:
-- `quantized.metal`: Q8 dequantization and matmul kernels
-- Optimized for Apple Silicon's Neural Engine and GPU
-
----
-
-## 3. Tokenizer Initialization
-
-### Tokenizer Loading
-**File**: `mistral_rs/mistralrs-core/src/pipeline/gguf.rs`
+### Quantized Matrix Multiplication
+**File:** `mistralrs-core/src/models/quantized_llama.rs:29-42`
 
 ```rust
-let tokenizer = get_tokenizer(
-    &paths.get_tokenizer_filename()?,
-    Some(tokenizer_json),
-    &token_source,
-    revision,
-    silent,
-)?;
-```
+struct Mlp {
+    feed_forward_w1: Arc<dyn QuantMethod>,  // GgufMatMul
+    feed_forward_w2: Arc<dyn QuantMethod>,
+    feed_forward_w3: Arc<dyn QuantMethod>,
+}
 
-**File**: `mistral_rs/mistralrs-core/src/utils/tokenizer.rs`
-
-Tokenizer is loaded from `tokenizer.json`:
-- Uses `tokenizers` crate
-- Handles BPE/Unigram tokenization
-- Maps tokens to IDs and vice versa
-
----
-
-## 4. Forward Pass
-
-### Pipeline Forward
-**File**: `mistral_rs/mistralrs-core/src/pipeline/normal.rs`
-
-```rust
-impl Pipeline for NormalPipeline {
-    fn forward_inputs(
-        &mut self,
-        inputs: Box<dyn Any>,
-        return_raw_logits: bool,
-    ) -> Result<ForwardInputsResult> {
-        // Extract input IDs, positions, etc.
-        let logits = self.model.forward(
-            &input_ids,
-            &seqlen_offsets,
-            context_lens,
-            position_ids,
-            paged_attn_meta,
-        )?;
-        ...
+impl Mlp {
+    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
+        let w1 = MatMul.qmethod_matmul(xs, &*self.feed_forward_w1)?;
+        let w3 = MatMul.qmethod_matmul(xs, &*self.feed_forward_w3)?;
+        let y = &(candle_nn::ops::silu(&w1)? * w3)?;
+        MatMul.qmethod_matmul(y, &*self.feed_forward_w2)
     }
 }
 ```
 
-### Model Forward Pass
-**File**: `mistral_rs/mistralrs-core/src/models/quantized_llama.rs`
+---
 
-The quantized LLaMA model forward pass:
+## 6. Pipeline Creation
+
+### GGUFPipeline Structure
+**File:** `mistralrs-core/src/pipeline/gguf.rs:76-85`
+
+```rust
+pub struct GGUFPipeline {
+    model: Model,  // enum of QLlama, QPhi, etc.
+    tokenizer: Arc<Tokenizer>,
+    no_kv_cache: bool,
+    chat_template: Arc<ChatTemplate>,
+    model_id: String,
+    metadata: Arc<GeneralMetadata>,
+    mapper: Box<dyn DeviceMapper + Send + Sync>,
+}
+```
+
+---
+
+## 7. Engine Initialization
+
+### MistralRsBuilder
+**File:** `mistralrs-core/src/lib.rs:271-366`
+
+```rust
+pub struct MistralRsBuilder {
+    pipeline: Arc<tokio::sync::Mutex<dyn Pipeline>>,
+    method: SchedulerConfig,
+    search_embedding_model: Option<SearchEmbeddingModel>,
+    // ...
+}
+```
+
+### Engine Thread for Metal (with autoreleasepool)
+**File:** `mistralrs-core/src/lib.rs:413-437`
+
+```rust
+let engine_handler = thread::spawn(move || {
+    #[cfg(feature = "metal")]
+    objc::rc::autoreleasepool(move || {
+        let rt = Runtime::new().unwrap();
+        rt.block_on(async move {
+            let engine = Engine::new(
+                tx_for_engine, rx, pipeline, method,
+                no_kv_cache, no_prefix_cache, prefix_cache_n,
+                // ...
+            ).expect("Engine creation failed.");
+            Arc::new(engine).run().await;
+        })
+    });
+    // ...
+});
+```
+
+---
+
+## 8. Request Processing
+
+### Chat Request Creation
+**File:** `mistralrs/src/model.rs:106-148`
+
+```rust
+pub async fn send_chat_request<R: RequestLike>(
+    &self,
+    mut request: R,
+) -> anyhow::Result<ChatCompletionResponse> {
+    let (tx, mut rx) = channel(1);
+    
+    let request = Request::Normal(Box::new(NormalRequest {
+        messages: request.take_messages(),
+        sampling_params: request.take_sampling_params(),
+        response: tx,
+        is_streaming: false,
+        // ...
+    }));
+    
+    self.runner.get_sender(None)?.send(request).await?;
+    // Wait for response...
+}
+```
+
+---
+
+## 9. Forward Pass Execution
+
+### Model Forward
+**File:** `mistralrs-core/src/models/quantized_llama.rs:647-700`
 
 ```rust
 impl ModelWeights {
     pub fn forward(
         &self,
-        xs: &Tensor,
-        start_offsets: &[usize],
-        context_lens: Option<&[usize]>,
-        position_ids: Option<&Tensor>,
-        paged_attn_meta: Option<((Tensor, Tensor), &PagedAttentionInputMetadata)>,
-    ) -> Result<Tensor> {
-        // 1. Token embeddings
-        let xs = self.embeddings.forward(xs)?;
-        
-        // 2. Apply RoPE positional embeddings
-        // 3. Pass through transformer layers
-        for layer in &self.layers {
-            xs = layer.forward(&xs, mask, start_offsets, &mut kv_cache, ...)?;
-        }
-        
-        // 4. Final layer norm
-        let xs = self.norm.forward(&xs)?;
-        
-        // 5. Output projection (logits)
-        MatMul.qmethod_matmul(&xs, &*self.output)  // Q8 matmul
-    }
-}
-```
-
-### Layer Forward Pass
-**File**: `mistral_rs/mistralrs-core/src/models/quantized_llama.rs`
-
-Each transformer layer:
-
-```rust
-impl LayerWeights {
-    fn forward(
-        &self,
         x: &Tensor,
-        mask: Option<&Tensor>,
         start_offsets: &[usize],
-        kv_cache: &mut KvCache,
-        ...
+        context_lens: Vec<(usize, usize)>,
+        metadata: Option<(Vec<(Tensor, Tensor)>, &PagedAttentionInputMetadata)>,
     ) -> Result<Tensor> {
-        // 1. Attention norm (RMSNorm)
-        let x_norm = self.attention_norm.forward(x)?;
+        let mut layer_in = self.tok_embeddings.forward(x)?;
         
-        // 2. Self-attention (Q8 matmuls)
-        let attn_out = self.forward_attn(&x_norm, mask, start_offsets, kv_cache, ...)?;
-        let x = (x + attn_out)?;
-        
-        // 3. FFN norm (RMSNorm)
-        let x_norm = self.ffn_norm.forward(&x)?;
-        
-        // 4. MLP/MoE (Q8 matmuls)
-        let mlp_out = self.mlp_or_moe.forward(&x_norm)?;
-        let x = (x + mlp_out)?;
-        
-        Ok(x)
-    }
-}
-```
-
-### Q8 Matrix Multiplication
-**File**: `mistral_rs/mistralrs-quant/src/gguf/mod.rs`
-
-```rust
-impl QuantMethod for GgufMatMul {
-    fn forward(&self, a: &Tensor) -> Result<Tensor> {
-        // Q8 matmul: (FP16 activations @ INT8 weights) -> FP32 -> FP16
-        let x = self.w.forward(a)?;  // Uses Metal kernels
-        if let Some(ref b) = self.b {
-            x.broadcast_add(b)
-        } else {
-            Ok(x)
-        }
-    }
-}
-```
-
-**Optimization**: Q8 weights are stored as INT8, activations as FP16. Metal kernels perform:
-- INT8 × FP16 → INT32 accumulation
-- Scale to FP32
-- Convert to FP16 output
-
----
-
-## 5. Sampling
-
-### Sampler
-**File**: `mistral_rs/mistralrs-core/src/sampler.rs`
-
-```rust
-impl Sampler {
-    pub fn sample(
-        &self,
-        logits: &Tensor,
-        rng: &mut Isaac64Rng,
-        context: &[u32],
-    ) -> Result<u32> {
-        // 1. Apply logits processors
-        let mut logits = self.apply_logits_processors(logits, context)?;
-        
-        // 2. Apply temperature, top-k, top-p
-        if let Some(temp) = self.temperature {
-            logits = (logits / temp)?;
+        for (i, layer) in self.layers.iter().enumerate() {
+            // Apply attention norm
+            let x = layer.attention_norm.forward(&x)?;
+            // Self-attention with RoPE
+            let attn = layer.forward_attn(&x, mask, start_offsets, cache, metadata)?;
+            let x = (attn + residual)?;
+            // MLP
+            let x = layer.ffn_norm.forward(&x)?;
+            let x = layer.mlp_or_moe.forward(&x)?;
+            layer_in = (x + residual)?;
         }
         
-        // 3. Sample token ID
-        let probs = candle_nn::ops::softmax_last_dim(&logits)?;
-        let token_id = self.sample_from_probs(&probs, rng)?;
-        
-        Ok(token_id)
+        // Final norm and output projection
+        let layer_in = self.norm.forward(&layer_in)?;
+        MatMul.qmethod_matmul(&layer_in, &*self.output)
     }
 }
 ```
 
----
-
-## 6. Text Generation Loop
-
-### Engine Processing
-**File**: `mistral_rs/mistralrs-core/src/engine.rs`
-
-The engine orchestrates the generation loop:
+### Attention Implementation
+**File:** `mistralrs-core/src/models/quantized_llama.rs:140-211`
 
 ```rust
-// Prefill: Process prompt tokens
-for token in prompt_tokens {
-    let logits = pipeline.forward_inputs(...)?;
-}
-
-// Decode: Generate tokens one by one
-loop {
-    let logits = pipeline.forward_inputs(...)?;
-    let token_id = sampler.sample(&logits, &mut rng, &context)?;
-    context.push(token_id);
+fn forward_attn(&self, x: &Tensor, ...) -> Result<Tensor> {
+    // Compute Q, K, V projections
+    let q = MatMul.qmethod_matmul(x, &*self.attention_wq)?.to_dtype(self.dtype)?;
+    let k = MatMul.qmethod_matmul(x, &*self.attention_wk)?.to_dtype(self.dtype)?;
+    let v = MatMul.qmethod_matmul(x, &*self.attention_wv)?.to_dtype(self.dtype)?;
     
-    // Decode and print
-    let text = tokenizer.decode(&[token_id], false)?;
-    print!("{}", text);
+    // Apply RoPE
+    let (q, k) = self.rotary.forward(&q, &k, start_offsets)?;
     
-    if token_id == eos_token_id {
-        break;
-    }
+    // Run attention (with or without PagedAttention)
+    let y = match &self.paged_attn {
+        Some(paged_attn) => paged_attn.forward(&q, &k, &v, ...),
+        None => Sdpa.run_attention(&q, &k, &v, mask, None, &self.sdpa_params)?,
+    };
+    
+    // Output projection
+    MatMul.qmethod_matmul(&y, &*self.attention_wo)
 }
-```
-
-### Response Output
-**File**: `mistral_rs/mistralrs/src/text_model.rs`
-
-```rust
-let response = model.send_chat_request(messages).await?;
-println!("{}", response.choices[0].message.content.as_ref().unwrap());
 ```
 
 ---
 
-## Key Optimizations for Apple Metal
+## 10. Sampling
 
-### 1. Q8 Quantization
-- **Weights**: INT8 format (50% memory reduction vs FP16)
-- **Activations**: FP16 (native Metal support)
-- **Scales**: FP32 (precision for scaling)
-- **Kernels**: Metal shaders for INT8×FP16 matmul
-
-### 2. Metal-Specific Optimizations
-- **Unified Memory**: No CPU-GPU transfers
-- **Command Buffers**: Batched operations
-- **SIMD Groups**: Efficient parallel execution
-- **Neural Engine**: Leverages Apple Silicon acceleration
-
-### 3. Memory Management
-- **KV Cache**: Efficient attention caching
-- **Paged Attention**: Optional for long sequences
-- **Prefix Caching**: Reuse common prefixes
-
-### 4. Quantization Guard
-**File**: `mistral_rs/mistralrs-quant/src/lib.rs`
+### Sampling Process
+**File:** `mistralrs-core/src/pipeline/sampling.rs:28-68`
 
 ```rust
-impl QuantizeOntoGuard {
-    pub fn acquire(&self, device: &Device) -> QuantizeOntoDropGuard<'_> {
-        #[cfg(feature = "metal")]
-        if let Device::Metal(dev) = device {
-            // Wait for outstanding work to avoid encoder conflicts
-            dev.wait_until_completed()?;
+pub(crate) async fn finish_or_add_toks_to_seq(
+    this: &dyn Pipeline,
+    prefix_cacher: &mut PrefixCacheManagerV2,
+    seq: &mut Sequence,
+    logprobs: Logprobs,
+    eos_tok: Option<&[u32]>,
+    use_prefix_cacher: bool,
+) -> Result<()> {
+    let mut is_done = seq.is_done(logprobs.token, eos_tok, this.get_metadata().max_seq_len);
+    seq.add_token(logprobs.clone(), ...);
+    // ...
+}
+```
+
+### SamplingParams
+**File:** `mistralrs-core/src/sampler.rs:31-68`
+
+```rust
+pub struct SamplingParams {
+    pub temperature: Option<f64>,
+    pub top_k: Option<usize>,
+    pub top_p: Option<f64>,
+    pub min_p: Option<f64>,
+    pub frequency_penalty: Option<f32>,
+    pub max_len: Option<usize>,
+    // ...
+}
+
+impl SamplingParams {
+    pub fn deterministic() -> Self {
+        Self {
+            temperature: None,
+            top_k: Some(1),  // Greedy sampling
+            // ...
         }
-        ...
     }
 }
 ```
 
 ---
 
-## File References Summary
+## 11. Response Generation
 
-| Component | File Path |
-|-----------|-----------|
-| Model Builder | `mistral_rs/mistralrs/src/text_model.rs` |
-| GGUF Loader | `mistral_rs/mistralrs-core/src/pipeline/gguf.rs` |
-| Q8 Quantization | `mistral_rs/mistralrs-quant/src/gguf/mod.rs` |
-| Quantized Model | `mistral_rs/mistralrs-core/src/models/quantized_llama.rs` |
-| Forward Pass | `mistral_rs/mistralrs-core/src/pipeline/normal.rs` |
-| Sampling | `mistral_rs/mistralrs-core/src/sampler.rs` |
-| Metal Kernels | `mistral_rs/mistralrs-quant/src/metal_kernels/` |
-| Device Setup | `mistral_rs/mistralrs-core/src/lib.rs` |
-| Tokenizer | `mistral_rs/mistralrs-core/src/utils/tokenizer.rs` |
+### Streaming Response
+**File:** `mistralrs/src/model.rs:51-102`
 
----
+```rust
+pub struct Stream<'a> {
+    _server: &'a Model,
+    rx: Receiver<Response>,
+}
 
-## Complete Inference Flow Diagram
-
-```
-User Input (text)
-    ↓
-Tokenizer.encode() → token_ids: Vec<u32>
-    ↓
-Model Loading:
-  - Load GGUF Q8 weights → Metal device
-  - Initialize tokenizer
-  - Set up Metal command queue
-    ↓
-Prefill Phase:
-  For each prompt token:
-    - Embedding lookup (FP16)
-    - Forward through layers:
-      * Attention (Q8 matmul)
-      * MLP (Q8 matmul)
-      * Layer norm (FP16)
-    - Update KV cache
-    ↓
-Decode Phase (loop):
-  - Forward pass (single token)
-  - Extract logits (vocab_size)
-  - Sample token_id
-  - Decode token_id → text
-  - Print text
-  - If EOS: break
-    ↓
-Final Response (text)
+impl Stream<'_> {
+    pub async fn next(&mut self) -> Option<Response> {
+        self.rx.recv().await
+    }
+}
 ```
 
 ---
 
-## Notes
+## Metal-Specific Optimizations
 
-- All Q8 operations use Metal-optimized kernels
-- FP16 activations leverage Apple Silicon's half-precision units
-- INT8 weights reduce memory bandwidth
-- Unified memory architecture eliminates transfer overhead
-- Command buffer batching improves GPU utilization
+### Memory Management
+**File:** `mistralrs-core/src/utils/memory_usage.rs:30-37`
+
+```rust
+#[cfg(feature = "metal")]
+Device::Metal(dev) => {
+    let max = dev.device().recommended_max_working_set_size();
+    let current = dev.device().current_allocated_size();
+    let avail = max.saturating_sub(current);
+    Ok(avail)
+}
+```
+
+### PagedAttention for Metal
+**File:** `mistralrs-core/src/paged_attention/layers/mod.rs:1-4`
+
+PagedAttention is supported on Metal (and CUDA) when the feature is enabled:
+```rust
+#[cfg(any(all(feature = "cuda", target_family = "unix"), feature = "metal"))]
+pub mod paged_attention;
+```
+
+### Autoreleasepool for Metal
+**File:** `mistralrs-core/src/lib.rs:415-437`
+
+The engine thread runs inside an `objc::rc::autoreleasepool` on Metal to properly manage Objective-C memory.
+
+---
+
+## Build Configuration
+
+### Cargo Features for Metal
+**File:** `mistralrs/Cargo.toml:37`
+
+```toml
+[features]
+metal = ["mistralrs-core/metal"]
+```
+
+Build command:
+```bash
+cargo build --release --features metal
+```
+
+---
+
+## Summary Flow
+
+1. **Device** → `Device::new_metal(0)` creates Metal device
+2. **Builder** → `GgufModelBuilder::new(model_id, files)` configures loading
+3. **Content** → GGUF file readers parse metadata and tensors
+4. **Architecture** → `GGUFArchitecture::from_value()` detects model type
+5. **Tokenizer** → Built from GGUF metadata or external file
+6. **Weights** → `ModelWeights::from_gguf()` loads quantized tensors to device
+7. **Pipeline** → `GGUFPipeline` wraps model, tokenizer, and metadata
+8. **Engine** → `MistralRsBuilder::build()` creates engine with scheduler
+9. **Request** → `model.send_chat_request(messages)` submits request
+10. **Forward** → Model executes transformer layers with quantized matmul
+11. **Sample** → Logits are sampled to produce tokens
+12. **Response** → Tokens decoded and returned as `ChatCompletionResponse`
 

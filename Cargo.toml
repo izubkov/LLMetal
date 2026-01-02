@@ -9,3 +9,16 @@ edition = "2024"
 gguf-rs = "0.1.4"  
 objc2-foundation = "0.3.1"
 objc2-metal = "0.3.1"
+# mistral_rs for inference - Metal enabled by default since it's the only option
+mistralrs = { path = "mistral_rs/mistralrs", features = ["metal"] }
+anyhow = "1.0"
+tokio = { version = "1.0", features = ["full"] }
+either = "1.15"
+
+[[bin]]
+name = "inference"
+path = "inference.rs"
+
+[[bin]]
+name = "inference_2"
+path = "inference_2.rs"
