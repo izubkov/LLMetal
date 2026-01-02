@@ -1,31 +1,375 @@
-# Inference Path Report: Apple Metal Q8 Devstral
+# Detailed Transformer Inference Path for Apple Metal (Q8 Quantization)
 
-This document traces the complete inference path in mistral_rs for Apple Metal devices with Q8 quantization, from model loading to token generation.
-
-## Overview
-
-The inference path follows these main stages:
-1. **Device Initialization** - Metal device setup
-2. **Model Loading** - GGUF file parsing and weight loading
-3. **Tokenizer Initialization** - Tokenizer setup from GGUF or HuggingFace
-4. **Model Forward Pass** - Transformer layer execution
-5. **Token Generation** - Autoregressive generation loop
+This document traces the complete, **step-by-step inference path** for running a GGUF quantized model on Apple Metal using mistral.rs. Each transformer operation is documented with code references.
 
 ---
 
-## 1. Device Initialization
+## Overview: The 12 Steps of Inference
 
-**File**: `mistral_rs/mistralrs/src/model.rs`
+```
+FOR EACH TOKEN:
+  1. Token Embedding: token_id → hidden_states [batch, seq, hidden_size]
 
-```12:24:mistral_rs/mistralrs/src/model.rs
-pub fn best_device(force_cpu: bool) -> Result<Device> {
-    if force_cpu {
-        return Ok(Device::Cpu);
-    }
-    #[cfg(not(feature = "metal"))]
+FOR EACH LAYER (repeated n_layers times):
+  2. Pre-Attention RMS Norm
+  3. Q/K/V Projections (quantized matmul)
+  4. RoPE (Rotary Position Embedding)
+  5. KV Cache Update
+  6. SDPA (Scaled Dot-Product Attention)
+  7. Output Projection
+  8. Residual Connection (Post-Attention)
+  9. Pre-FFN RMS Norm + Feed-Forward (SwiGLU)
+  8. Residual Connection (Post-FFN)
+
+AFTER ALL LAYERS:
+  10. Final RMS Norm
+  11. LM Head (Vocabulary Projection)
+  12. Sampling (Temperature, Top-k, Top-p)
+```
+
+---
+
+## Step 1: Token Embedding Lookup
+
+Converts token IDs to dense vectors using an embedding table.
+
+**File:** `mistralrs-core/src/models/quantized_llama.rs:655`
+
+```rust
+let mut layer_in = self.tok_embeddings.forward(x)?;
+```
+
+- **Input:** `token_ids` `[batch_size, seq_len]` - integers
+- **Output:** `hidden_states` `[batch_size, seq_len, hidden_size]` - float tensors
+- **Note:** The embedding table is typically dequantized from GGUF
+
+---
+
+## Step 2: RMS Normalization (Pre-Attention)
+
+Root Mean Square Layer Normalization applied before attention.
+
+**File:** `mistralrs-core/src/layers.rs:305-307`
+
+```rust
+pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
+    candle_nn::ops::rms_norm(&x.contiguous()?, &self.weight, self.eps as f32)
+}
+```
+
+**Formula:**
+```
+RMSNorm(x) = x * rsqrt(mean(x²) + eps) * weight
+```
+
+This is more efficient than LayerNorm as it doesn't center (subtract the mean).
+
+---
+
+## Step 3: Q, K, V Projections (Quantized MatMul)
+
+Projects hidden states into Query, Key, Value spaces using quantized weights.
+
+**File:** `mistralrs-core/src/models/quantized_llama.rs:151-159`
+
+```rust
+let q = MatMul.qmethod_matmul(x, &*self.attention_wq)?
+    .to_dtype(self.dtype)?;
+let k = MatMul.qmethod_matmul(x, &*self.attention_wk)?
+    .to_dtype(self.dtype)?;
+let v = MatMul.qmethod_matmul(x, &*self.attention_wv)?
+    .to_dtype(self.dtype)?;
+```
+
+**For Q8_0 Quantization:**
+- Weights stored as 8-bit integers with block-wise scaling
+- Block size: 32 elements share one fp16 scale factor
+- Dequantization: `w_float = w_int8 * scale`
+- Memory reduction: ~4x vs fp32, ~2x vs fp16
+
+**Grouped Query Attention (GQA):**
+- Q has `n_heads * head_dim` dimensions
+- K, V have `n_kv_heads * head_dim` dimensions (fewer heads, shared across groups)
+
+**Reshape to attention format:**
+```rust
+let q = q.reshape((b_sz, seq_len, self.n_head, self.head_dim))?
+         .transpose(1, 2)?;  // [batch, n_heads, seq, head_dim]
+```
+
+---
+
+## Step 4: Rotary Position Embedding (RoPE)
+
+Applies rotational position encoding to Q and K tensors.
+
+**File:** `mistralrs-core/src/models/quantized_llama.rs:179`
+
+```rust
+let (q, k) = self.rotary.forward(&q, &k, start_offsets)?;
+```
+
+**RoPE Formula:**
+```
+For each position pos and dimension pair (i, i+1):
+  theta_i = base^(-2i/dim)
+  cos_theta = cos(pos * theta_i)
+  sin_theta = sin(pos * theta_i)
+  [q_new_i, q_new_{i+1}] = [q_i * cos - q_{i+1} * sin, q_i * sin + q_{i+1} * cos]
+```
+
+This encodes absolute position while allowing relative position attention.
+
+---
+
+## Step 5: KV Cache Update
+
+Appends current K, V to the cache for autoregressive generation.
+
+**File:** `mistralrs-core/src/models/quantized_llama.rs:196-200`
+
+```rust
+let (k, v) = kv_cache.append(&k, &v)?;
+```
+
+**During generation:**
+- First token: `K_cache = K, V_cache = V`
+- Subsequent tokens: `K_cache = concat([K_cache, K_new], dim=seq)`
+
+This enables reusing previous computations.
+
+---
+
+## Step 6: Scaled Dot-Product Attention (SDPA)
+
+The core attention mechanism.
+
+**File:** `mistralrs-core/src/attention/mod.rs:106-155`
+
+```rust
+pub fn run_attention(
+    &self, q: &Tensor, k: &Tensor, v: &Tensor,
+    mask: Option<&Tensor>, flash_params: Option<&FlashParams>,
+    sdpa_params: &SdpaParams,
+) -> Result<Tensor> {
+    // ...
+    if [q, k, v].into_iter().all(|x| x.device().is_metal())
+        && all_head_dims_match && valid_head_dims.contains(&head_dim) && can_use_mask
     {
-        Device::cuda_if_available(0)
+        return candle_nn::ops::sdpa(q, k, v, mask.as_ref(), /* ... */);
     }
+    // ...
+}
+```
+
+**Formula:**
+```
+Attention(Q, K, V) = softmax(Q @ K.T / sqrt(head_dim)) @ V
+```
+
+**Metal Optimizations:**
+- Uses fused Metal SDPA kernel for valid head dimensions: `[32, 64, 72, 80, 96, 128]`
+- Vector SDPA for single-token generation
+- Full SDPA for prefill (prompt processing)
+
+---
+
+## Step 7: Output Projection
+
+Projects attention output back to hidden_size dimensions.
+
+**File:** `mistralrs-core/src/models/quantized_llama.rs:203-209`
+
+```rust
+let y = if mask.is_some() {
+    y.transpose(1, 2)?.reshape((b_sz, seq_len, ()))?
+} else {
+    y.reshape((b_sz, seq_len, ()))?
+};
+let y = MatMul.qmethod_matmul(&y.to_dtype(x.dtype())?, &*self.attention_wo)?;
+```
+
+---
+
+## Step 8: Residual Connection (Post-Attention)
+
+Adds the attention output to the original input (skip connection).
+
+**File:** `mistralrs-core/src/models/quantized_llama.rs:691`
+
+```rust
+let x = (attn + residual)?;
+```
+
+This helps with gradient flow and preserves information.
+
+---
+
+## Step 9: Feed-Forward Network (SwiGLU)
+
+The MLP block with SwiGLU activation.
+
+**File:** `mistralrs-core/src/models/quantized_llama.rs:36-41`
+
+```rust
+impl Mlp {
+    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
+        let w1 = MatMul.qmethod_matmul(xs, &*self.feed_forward_w1)?;  // gate
+        let w3 = MatMul.qmethod_matmul(xs, &*self.feed_forward_w3)?;  // up
+        let y = &(candle_nn::ops::silu(&w1)? * w3)?;                   // SwiGLU
+        MatMul.qmethod_matmul(y, &*self.feed_forward_w2)              // down
+    }
+}
+```
+
+**SwiGLU Formula:**
+```
+gate = W1(x)                      # gate projection
+up = W3(x)                        # up projection
+hidden = SiLU(gate) * up          # SwiGLU activation
+output = W2(hidden)               # down projection
+
+SiLU(x) = x * sigmoid(x)          # Swish activation
+```
+
+---
+
+## Step 10: Final RMS Normalization
+
+Applied after all layers, before the LM head.
+
+**File:** `mistralrs-core/src/models/quantized_llama.rs:701`
+
+```rust
+let x = self.norm.forward(&layer_in)?;
+```
+
+---
+
+## Step 11: LM Head (Vocabulary Projection)
+
+Projects final hidden states to vocabulary logits.
+
+**File:** `mistralrs-core/src/models/quantized_llama.rs:702-705`
+
+```rust
+extract_logits(
+    &MatMul.qmethod_matmul(&x.contiguous()?, &*self.output)?,
+    context_lens,
+)
+```
+
+- **Input:** `hidden_states` `[batch, seq, hidden_size]`
+- **Output:** `logits` `[batch, seq, vocab_size]`
+
+Often the LM head weights are tied to the embedding weights (transposed).
+
+---
+
+## Step 12: Sampling
+
+Converts logits to probabilities and samples the next token.
+
+**File:** `mistralrs-core/src/pipeline/sampling.rs`
+
+**Sampling Options:**
+- **Greedy:** `argmax(logits)`
+- **Temperature:** `logits / temperature → softmax → sample`
+- **Top-k:** Keep only top-k logits → softmax → sample
+- **Top-p (nucleus):** Keep cumulative prob ≤ p → sample
+
+---
+
+## Complete Forward Pass (Pseudocode)
+
+```python
+def forward(token_ids, kv_caches):
+    # Step 1: Token embedding
+    hidden = embedding_table[token_ids]  # [batch, seq, hidden_size]
+    
+    for layer_idx in range(n_layers):
+        residual = hidden
+        
+        # Step 2: Pre-attention normalization
+        hidden = rms_norm(hidden, attn_norm_weight)
+        
+        # Step 3: Q, K, V projections (quantized matmul)
+        Q = dequant_matmul(hidden, Wq)  # [batch, seq, n_heads * head_dim]
+        K = dequant_matmul(hidden, Wk)  # [batch, seq, n_kv_heads * head_dim]
+        V = dequant_matmul(hidden, Wv)
+        
+        # Reshape to [batch, heads, seq, head_dim]
+        Q = Q.reshape(batch, seq, n_heads, head_dim).transpose(1, 2)
+        K = K.reshape(batch, seq, n_kv_heads, head_dim).transpose(1, 2)
+        V = V.reshape(batch, seq, n_kv_heads, head_dim).transpose(1, 2)
+        
+        # Step 4: Apply rotary position embedding
+        Q, K = apply_rope(Q, K, positions, cos_cache, sin_cache)
+        
+        # Step 5: Update KV cache
+        K, V = update_kv_cache(K, V, kv_caches[layer_idx])
+        
+        # Step 6: Scaled dot-product attention
+        K = repeat_kv(K, n_kv_groups)  # GQA expansion
+        V = repeat_kv(V, n_kv_groups)
+        attn = softmax(Q @ K.T / sqrt(head_dim) + causal_mask) @ V
+        
+        # Step 7: Output projection
+        attn = attn.transpose(1, 2).reshape(batch, seq, hidden_size)
+        hidden = dequant_matmul(attn, Wo)
+        
+        # Step 8: Residual connection
+        hidden = residual + hidden
+        residual = hidden
+        
+        # Pre-FFN normalization
+        hidden = rms_norm(hidden, ffn_norm_weight)
+        
+        # Step 9: Feed-forward network (SwiGLU)
+        gate = dequant_matmul(hidden, W1)
+        up = dequant_matmul(hidden, W3)
+        hidden = silu(gate) * up
+        hidden = dequant_matmul(hidden, W2)
+        
+        # Residual connection
+        hidden = residual + hidden
+    
+    # Step 10: Final normalization
+    hidden = rms_norm(hidden, final_norm_weight)
+    
+    # Step 11: Project to vocabulary
+    logits = dequant_matmul(hidden, lm_head_weight)
+    
+    # Step 12: Sample next token
+    next_token = sample(logits[:, -1, :], temperature, top_k, top_p)
+    
+    return next_token
+```
+
+---
+
+## Metal-Specific Optimizations
+
+### 1. Fused SDPA Kernel
+**File:** `mistralrs-core/src/attention/mod.rs:187-200`
+
+```rust
+if [q, k, v].into_iter().all(|x| x.device().is_metal())
+    && all_head_dims_match
+    && valid_head_dims.contains(&head_dim)
+    && can_use_mask
+{
+    return candle_nn::ops::sdpa(q, k, v, mask.as_ref(), ...);
+}
+```
+
+Valid head dimensions for Metal SDPA: `[32, 64, 72, 80, 96, 128]` (vector), `[32, 64, 72, 80, 96, 128]` (full).
+
+### 2. Device Selection
+**File:** `mistralrs/src/model.rs:12-24`
+
+```rust
+pub fn best_device(force_cpu: bool) -> Result<Device> {
     #[cfg(feature = "metal")]
     {
         Device::new_metal(0)
@@ -33,460 +377,55 @@ pub fn best_device(force_cpu: bool) -> Result<Device> {
 }
 ```
 
-**Comment**: On macOS with Metal feature enabled, this creates a Metal device. The device is used throughout for tensor operations and Metal kernel execution.
+### 3. Quantized Matrix Multiplication
+**File:** `mistralrs-quant/src/gguf/mod.rs`
+
+- Uses `GgufMatMul` for quantized weight operations
+- Block-wise dequantization optimized for Metal
 
 ---
 
-## 2. Model Builder and Loading Entry Point
+## Key Files Reference
 
-**File**: `mistral_rs/mistralrs/src/gguf.rs`
-
-```224:256:mistral_rs/mistralrs/src/gguf.rs
-pub async fn build(self) -> anyhow::Result<Model> {
-    let config = GGUFSpecificConfig {
-        topology: self.topology,
-    };
-
-    if self.with_logging {
-        initialize_logging();
-    }
-
-    let loader = GGUFLoaderBuilder::new(
-        self.chat_template,
-        self.tok_model_id,
-        self.model_id,
-        self.files,
-        config,
-        self.no_kv_cache,
-        self.jinja_explicit,
-    )
-    .build();
-
-    // Load, into a Pipeline
-    let pipeline = loader.load_model_from_hf(
-        self.hf_revision,
-        self.token_source,
-        &ModelDType::Auto,
-        &self.device.unwrap_or(best_device(self.force_cpu).unwrap()),
-        !self.with_logging,
-        self.device_mapping
-            .unwrap_or(DeviceMapSetting::Auto(AutoDeviceMapParams::default_text())),
-        None,
-        self.paged_attn_cfg,
-    )?;
-```
-
-**Comment**: The `GgufModelBuilder` creates a `GGUFLoaderBuilder` which builds a loader. The loader's `load_model_from_hf` method handles the actual model loading process.
+| Component | File Path |
+|-----------|-----------|
+| Model Forward Pass | `mistralrs-core/src/models/quantized_llama.rs` |
+| RMS Normalization | `mistralrs-core/src/layers.rs:291-307` |
+| Attention (SDPA) | `mistralrs-core/src/attention/mod.rs` |
+| Quantized MatMul | `mistralrs-quant/src/gguf/mod.rs` |
+| RoPE Embedding | `mistralrs-core/src/layers.rs` (RotaryEmbedding) |
+| Sampling | `mistralrs-core/src/pipeline/sampling.rs` |
+| Metal Device | `mistralrs/src/model.rs:12-24` |
+| GGUF Loading | `mistralrs-core/src/pipeline/gguf.rs` |
+| Tokenizer Conversion | `mistralrs-core/src/gguf/gguf_tokenizer.rs` |
 
 ---
 
-## 3. GGUF File Loading
+## Example: Devstral/Mistral Configuration
 
-**File**: `mistral_rs/mistralrs-core/src/pipeline/gguf.rs`
-
-```264:294:mistral_rs/mistralrs-core/src/pipeline/gguf.rs
-fn load_model_from_hf(
-    &self,
-    revision: Option<String>,
-    token_source: TokenSource,
-    dtype: &dyn TryIntoDType,
-    device: &Device,
-    silent: bool,
-    mapper: DeviceMapSetting,
-    in_situ_quant: Option<IsqType>,
-    paged_attn_config: Option<PagedAttentionConfig>,
-) -> Result<Arc<Mutex<dyn Pipeline + Send + Sync>>> {
-    let _progress_guard = ProgressScopeGuard::new(silent);
-    let paths: anyhow::Result<Box<dyn ModelPaths>> = get_paths_gguf!(
-        LocalModelPaths,
-        &token_source,
-        revision,
-        self,
-        self.quantized_model_id.clone(),
-        self.quantized_filenames.clone(),
-        silent
-    );
-    self.load_model_from_path(
-        &paths?,
-        dtype,
-        device,
-        silent,
-        mapper,
-        in_situ_quant,
-        paged_attn_config,
-    )
+```rust
+ModelConfig {
+    n_layers: 32,
+    vocab_size: 32000,
+    hidden_size: 4096,
+    n_heads: 32,
+    n_kv_heads: 8,        // GQA with 4 groups
+    head_dim: 128,
+    intermediate_size: 14336,
+    rms_norm_eps: 1e-5,
+    rope_theta: 10000.0,
+    max_seq_len: 32768,
+    rope_dim: 128,
 }
 ```
 
-**Comment**: This resolves model paths (local or HuggingFace) and delegates to `load_model_from_path` for actual loading.
-
 ---
 
-## 4. GGUF File Parsing and Weight Loading
+## Running the Detailed Inference Demo
 
-**File**: `mistral_rs/mistralrs-core/src/pipeline/gguf.rs`
+```bash
+# Compile and run the detailed inference demonstration
+cargo run --release --bin inference_2
 
-```316:467:mistral_rs/mistralrs-core/src/pipeline/gguf.rs
-let mut readers = Vec::new();
-for filename in paths.get_weight_filenames() {
-    readers.push(std::fs::File::open(filename)?);
-}
-let mut readers = readers.iter_mut().collect::<Vec<_>>();
-
-let model = Content::from_readers(&mut readers)?;
-if !silent {
-    model.print_metadata()?;
-}
-let arch = model.arch();
-
-// If auto, convert to Map
-let num_layers = model.get_metadata()[&format!("{arch}.block_count")].to_u32()? as usize;
-if let DeviceMapSetting::Auto(params) = mapper.clone() {
-    let devices = device_map::get_all_similar_devices(device)?;
-    // Initial dtype
-    let dtype = dtype.try_into_dtype(&devices.iter().collect::<Vec<_>>())?;
-
-    let model = GgufDeviceMapLoaderInner {
-        model: &model,
-        arch,
-    };
-
-    let layer_sizes_in_bytes =
-        model.layer_sizes_in_bytes("this is a dummy config!", dtype, 1, None)?;
-    let non_mapped_size_in_bytes =
-        model.non_mapped_size_in_bytes("this is a dummy config!", dtype, 1, None)?;
-    let total_model_size_in_bytes =
-        layer_sizes_in_bytes.iter().sum::<usize>() + non_mapped_size_in_bytes;
-
-    let new = model.get_device_layers(
-        "this is a dummy config!",
-        num_layers,
-        layer_sizes_in_bytes,
-        non_mapped_size_in_bytes,
-        total_model_size_in_bytes,
-        &devices,
-        dtype,
-        &params,
-        paged_attn_config.as_ref(),
-    )?;
-    mapper = DeviceMapSetting::Map(new);
-}
+# The inference_2.rs file contains all 12 steps with detailed documentation
 ```
-
-**Comment**: The GGUF file is parsed using `Content::from_readers`, which reads the GGUF format (header, metadata, tensors). For Metal devices, device mapping determines which layers go on which devices (typically all on Metal for single-device setups).
-
----
-
-## 5. Model Weight Construction
-
-**File**: `mistral_rs/mistralrs-core/src/pipeline/gguf.rs`
-
-```444:467:mistral_rs/mistralrs-core/src/pipeline/gguf.rs
-// Config into model:
-let model = match self.kind {
-    ModelKind::GgufQuantized { .. } => match arch {
-        GGUFArchitecture::Llama => Model::Llama(QLlama::try_from(model_config)?),
-        GGUFArchitecture::Phi2 => Model::Phi2(QPhi::try_from(model_config)?),
-        GGUFArchitecture::Phi3 => Model::Phi3(QPhi3::try_from(model_config)?),
-        GGUFArchitecture::Starcoder2 => {
-            Model::Starcoder2(QStarcoder2::try_from(model_config)?)
-        }
-        GGUFArchitecture::Qwen2 => Model::Qwen(QQwen::try_from(model_config)?),
-        GGUFArchitecture::Qwen3 => Model::Qwen3(QQwen3::try_from(model_config)?),
-        GGUFArchitecture::Qwen3MoE => Model::Qwen3MoE(QQwen3MoE::try_from(model_config)?),
-        a => bail!("Unsupported architecture `{a:?}` for GGUF"),
-    },
-```
-
-**Comment**: Based on the GGUF architecture (Llama for Devstral), a quantized model (`QLlama`) is constructed. The `try_from` method loads quantized weights (Q8) from the GGUF file and creates Metal tensors.
-
----
-
-## 6. Tokenizer Initialization
-
-**File**: `mistral_rs/mistralrs-core/src/pipeline/gguf.rs`
-
-```383:397:mistral_rs/mistralrs-core/src/pipeline/gguf.rs
-let GgufTokenizerConversion {
-    tokenizer,
-    bos,
-    eos,
-    unk,
-} = if paths.get_tokenizer_filename().to_string_lossy().is_empty() {
-    convert_gguf_to_hf_tokenizer(&model)?
-} else {
-    GgufTokenizerConversion {
-        tokenizer: get_tokenizer(paths.get_tokenizer_filename(), None)?,
-        bos: None,
-        eos: None,
-        unk: None,
-    }
-};
-```
-
-**Comment**: The tokenizer is either extracted from GGUF metadata or loaded from a separate `tokenizer.json` file. This tokenizer is used for encoding prompts and decoding generated tokens.
-
----
-
-## 7. Metal Kernel Loading
-
-**File**: `mistral_rs/mistralrs-quant/src/metal_kernels/mod.rs`
-
-```68:107:mistral_rs/mistralrs-quant/src/metal_kernels/mod.rs
-pub fn load_library(&self, device: &Device) -> Result<Library, MetalKernelError> {
-    use objc2_foundation::{NSString, NSURL};
-
-    if let Some(lib) = LIBRARY.get() {
-        Ok(lib.clone())
-    } else {
-        // Try to load precompiled metallib first (faster startup)
-        let lib = if !KERNELS.is_empty() {
-            // Write precompiled metallib to a temp file and load via URL
-            // This avoids the complexity of creating DispatchData
-            let temp_dir = std::env::temp_dir();
-            let metallib_path = temp_dir.join("mistralrs_quant.metallib");
-            std::fs::write(&metallib_path, KERNELS).map_err(|e| {
-                MetalKernelError::CompilationError(format!(
-                    "Failed to write metallib to temp file: {e}"
-                ))
-            })?;
-
-            let url_string = format!("file://{}", metallib_path.display());
-            let ns_url_string = NSString::from_str(&url_string);
-            let url = NSURL::URLWithString(&ns_url_string).ok_or_else(|| {
-                MetalKernelError::CompilationError("Failed to create NSURL".to_string())
-            })?;
-
-            let raw_lib = device.as_ref().newLibraryWithURL_error(&url).map_err(|e| {
-                MetalKernelError::CompilationError(format!(
-                    "Failed to load precompiled metallib: {e}"
-                ))
-            })?;
-            Library::new(raw_lib)
-```
-
-**Comment**: Metal kernels for quantized operations (Q8 dequantization, matrix multiplication) are loaded from a precompiled `.metallib` file. These kernels handle efficient GPU computation for quantized tensors.
-
----
-
-## 8. Q8 Quantization Handling
-
-**File**: `mistral_rs/mistralrs-quant/src/gguf/mod.rs`
-
-```52:59:mistral_rs/mistralrs-quant/src/gguf/mod.rs
-fn forward(&self, a: &Tensor) -> Result<Tensor> {
-    let x = self.w.forward(a)?;
-    if let Some(ref b) = self.b {
-        x.broadcast_add(b)
-    } else {
-        Ok(x)
-    }
-}
-```
-
-**Comment**: The `GgufMatMul` struct wraps quantized matrix multiplication. The `forward` method performs Q8 matrix multiplication using Metal kernels. Q8 weights are stored as INT8 with per-block scaling factors.
-
----
-
-## 9. Forward Pass - Model Execution
-
-**File**: `mistral_rs/mistralrs-core/src/models/quantized_llama.rs`
-
-The forward pass through transformer layers:
-
-```648:700:mistral_rs/mistralrs-core/src/models/quantized_llama.rs
-pub fn forward(
-    &self,
-    xs: &Tensor,
-    seqlen_offsets: &[usize],
-    start_pos: usize,
-    kv_cache: &mut Option<(Tensor, Tensor)>,
-    input_ids: Option<&Tensor>,
-    attention_mask: Option<&Tensor>,
-) -> Result<Tensor> {
-    // Token embeddings
-    let (_b_size, seq_len) = xs.dims2()?;
-    let mut xs = self.embeddings.forward(xs)?;
-    
-    // RoPE positional embeddings applied
-    // ... (RoPE application)
-    
-    // Transformer layers
-    for (layer_idx, layer) in self.layers.iter().enumerate() {
-        xs = layer.forward(
-            &xs,
-            seqlen_offsets,
-            start_pos,
-            &mut kv_cache,
-            attention_mask.as_ref(),
-        )?;
-    }
-    
-    // Final layer norm
-    xs = self.norm.forward(&xs)?;
-    
-    // Output projection (lm_head)
-    xs = self.lm_head.forward(&xs)?;
-    
-    Ok(xs)
-}
-```
-
-**Comment**: The forward pass:
-1. Embeds input tokens
-2. Applies RoPE positional encodings
-3. Passes through all transformer layers (attention + FFN)
-4. Applies final layer normalization
-5. Projects to vocabulary logits
-
-Each layer uses quantized Q8 weights via Metal kernels for efficient computation.
-
----
-
-## 10. Transformer Layer Forward Pass
-
-**File**: `mistral_rs/mistralrs-core/src/models/quantized_llama.rs`
-
-```141:213:mistral_rs/mistralrs-core/src/models/quantized_llama.rs
-fn forward_attn(
-    &self,
-    xs: &Tensor,
-    seqlen_offsets: &[usize],
-    start_pos: usize,
-    kv_cache: &mut Option<(Tensor, Tensor)>,
-    attention_mask: Option<&Tensor>,
-) -> Result<Tensor> {
-    let (b_size, q_len, _n_embd) = xs.dims3()?;
-    
-    // Attention pre-norm
-    let xs_norm = self.attention_norm.forward(xs)?;
-    
-    // QKV projection (quantized Q8)
-    let (q, k, v) = self.attention.forward(&xs_norm)?;
-    
-    // Apply RoPE to Q, K
-    // ... (RoPE application)
-    
-    // Update KV cache
-    // ... (KV cache update)
-    
-    // Causal attention
-    let attn_output = self.apply_rotary_emb(&q, &k, &v, seqlen_offsets, start_pos)?;
-    
-    // Output projection (quantized Q8)
-    let attn_output = self.attention.forward_output(&attn_output)?;
-    
-    // Residual connection
-    Ok(xs + attn_output)
-}
-```
-
-**Comment**: Each transformer layer:
-1. Applies RMSNorm
-2. Computes QKV projections (using Q8 quantized weights)
-3. Applies RoPE
-4. Performs attention computation
-5. Projects output (Q8 quantized)
-6. Adds residual connection
-
-The FFN follows a similar pattern with gate/up/down projections.
-
----
-
-## 11. Token Generation Loop
-
-**File**: `mistral_rs/mistralrs/src/model.rs`
-
-```106:148:mistral_rs/mistralrs/src/model.rs
-pub async fn send_chat_request<R: RequestLike>(
-    &self,
-    mut request: R,
-) -> anyhow::Result<ChatCompletionResponse> {
-    let (tx, mut rx) = channel(1);
-
-    let truncate_sequence = request.truncate_sequence();
-    let (tools, tool_choice) = if let Some((a, b)) = request.take_tools() {
-        (Some(a), Some(b))
-    } else {
-        (None, None)
-    };
-    let request = Request::Normal(Box::new(NormalRequest {
-        messages: request.take_messages(),
-        sampling_params: request.take_sampling_params(),
-        response: tx,
-        return_logprobs: request.return_logprobs(),
-        is_streaming: false,
-        id: 0,
-        constraint: request.take_constraint(),
-        suffix: None,
-        tools,
-        tool_choice,
-        logits_processors: request.take_logits_processors(),
-        return_raw_logits: false,
-        web_search_options: request.take_web_search_options(),
-        model_id: None,
-        truncate_sequence,
-    }));
-
-    self.runner.get_sender(None)?.send(request).await?;
-
-    let ResponseOk::Done(response) = rx
-        .recv()
-        .await
-        .context("Channel was erroneously closed!")?
-        .as_result()?
-    else {
-        anyhow::bail!("Got unexpected response type.")
-    };
-
-    Ok(response)
-}
-```
-
-**Comment**: The request is sent to the inference runner, which:
-1. Tokenizes the prompt
-2. Runs prefill (forward pass on all prompt tokens)
-3. Generates tokens autoregressively:
-   - Forward pass on current token
-   - Sample next token from logits
-   - Decode and append token
-   - Repeat until EOS or max tokens
-
----
-
-## 12. Metal Optimizations
-
-### Q8 Quantization on Metal
-
-**File**: `mistral_rs/mistralrs-quant/src/metal_kernels/quantized.metal`
-
-Metal kernels handle Q8 dequantization and matrix multiplication efficiently:
-- Q8 weights stored as INT8 with FP32 scales
-- Dequantization happens on-the-fly during matrix multiplication
-- Uses Metal's `simdgroup` operations for optimal performance
-- FP16 activations for Apple Silicon efficiency
-
-### Key Optimizations:
-
-1. **Unified Memory**: Metal uses unified memory architecture, reducing CPU-GPU transfers
-2. **Kernel Caching**: Metal kernels are compiled once and cached
-3. **Batch Processing**: Multiple sequences can be processed in parallel
-4. **KV Cache**: Attention KV cache stored on Metal device for fast access
-5. **Quantized Operations**: Direct INT8 operations without full dequantization
-
----
-
-## Summary
-
-The complete inference path:
-
-1. **Device**: `Device::new_metal(0)` creates Metal device
-2. **Loading**: `GGUFLoaderBuilder` → `load_model_from_hf` → `Content::from_readers` parses GGUF
-3. **Weights**: `QLlama::try_from` loads Q8 quantized weights into Metal tensors
-4. **Tokenizer**: `convert_gguf_to_hf_tokenizer` or `get_tokenizer` loads tokenizer
-5. **Kernels**: Metal kernels loaded from precompiled `.metallib`
-6. **Forward**: `model.forward()` → transformer layers → quantized matmuls via Metal
-7. **Generation**: Autoregressive loop: forward → sample → decode → repeat
-
-All operations leverage Metal's GPU acceleration with Q8 quantization for efficient inference on Apple Silicon.
-
