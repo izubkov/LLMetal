@@ -9,7 +9,7 @@
 //! - mistralrs-core/src/layers.rs
 //! - mistralrs-core/src/attention/mod.rs
 //!
-//! Build: cargo build --release --features metal --bin inference_2
+//! Historical note: this was an early detailed trace sketch, not the active binary.
 
 use anyhow::Result;
 // Candle tensor library (used by mistralrs under the hood)
@@ -697,8 +697,7 @@ fn main() -> Result<()> {
     println!("  - Autoreleasepool for proper ObjC memory management");
     println!();
     
-    println!("To run actual inference with a model, use:");
-    println!("  cargo run --release --features metal --bin inference_2 -- --model <path>");
+    println!("This file is kept as a historical note, not as an active binary.");
     println!();
     println!("Example model config (Devstral/Mistral):");
     let example_config = ModelConfig {

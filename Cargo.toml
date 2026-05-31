@@ -1,27 +1,10 @@
 [package]
-name = "LLMetal"
+name = "llmetal"
 version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-# gguf-rs = { version = "0.1.4", features = ["debug"] }
-# gguf-rs = { path = "../gguf-rs" }
-gguf-rs = "0.1.4"  
+anyhow = "1.0"
+gguf-rs = "0.1.4"
 objc2-foundation = "0.3.1"
 objc2-metal = "0.3.1"
-# mistral_rs for inference - Metal enabled by default since it's the only option
-mistralrs = { path = "mistral_rs/mistralrs", features = ["metal"] }
-anyhow = "1.0"
-tokio = { version = "1.0", features = ["full"] }
-either = "1.15"
-# Candle ML framework (used internally by mistralrs)
-candle-core = { git = "https://github.com/huggingface/candle.git", version = "0.9.2-alpha.2", rev = "8839457", features = ["metal"] }
-candle-nn = { git = "https://github.com/huggingface/candle.git", version = "0.9.2-alpha.2", rev = "8839457" }
-
-[[bin]]
-name = "inference"
-path = "inference.rs"
-
-[[bin]]
-name = "inference_2"
-path = "inference_2.rs"

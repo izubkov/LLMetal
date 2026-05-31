@@ -421,11 +421,11 @@ ModelConfig {
 
 ---
 
-## Running the Detailed Inference Demo
+## Running the Transparent Trace
 
 ```bash
-# Compile and run the detailed inference demonstration
-cargo run --release --bin inference_2
-
-# The inference_2.rs file contains all 12 steps with detailed documentation
+cargo run -- trace <model.gguf> "your prompt"
 ```
+
+The current binary prints the intended path through the model. It is a scaffold for
+the runtime, not a completed generator.
