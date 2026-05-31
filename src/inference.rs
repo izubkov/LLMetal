@@ -1,25 +1,26 @@
 use crate::gguf_loader::GgufModelInfo;
-use crate::metal::MetalDevice;
-use crate::tokenizer::PromptTokens;
+use crate::gpu::Gpu;
+use crate::tokenizer::PromptTokenizer;
 
 pub struct TransparentRunner {
     model: GgufModelInfo,
-    device: MetalDevice,
+    gpu: Gpu,
+    tokenizer: PromptTokenizer,
 }
 
 impl TransparentRunner {
-    pub fn new(model: GgufModelInfo, device: MetalDevice) -> Self {
-        Self { model, device }
+    pub fn new(model: GgufModelInfo, gpu: Gpu) -> Self {
+        let tokenizer = PromptTokenizer::new(model.vocab.clone());
+        Self { model, gpu, tokenizer }
     }
 
     pub fn describe_prompt_pass(&self, prompt: &str) {
-        let tokens = PromptTokens::from_prompt(prompt);
-
+        let name = self.gpu.device_name();
         println!("LLMetal transparent inference trace");
         println!("  model:  {}", self.model.path);
-        println!("  device: {}", self.device.name);
+        println!("  device: {}", name);
         println!("  prompt: {prompt:?}");
-        println!("  tokens: {}", tokens.explain());
+        println!("  tokens: {}", self.tokenizer.explain(prompt));
         println!();
 
         self.describe_prefill();

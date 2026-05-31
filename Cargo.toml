@@ -5,6 +5,8 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1.0"
-gguf-rs = "0.1.4"
-objc2-foundation = "0.3.1"
-objc2-metal = "0.3.1"
+byteorder = "1.5"
+gguf-rs = "0.1.5"
+half = "2"
+memmap2 = "0.9"
+metal = "0.33"

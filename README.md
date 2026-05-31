@@ -50,6 +50,16 @@ The style is closer to an annotated engine bay than a library API. If a future o
 
 ## Current Status
 
-This repository is not benchmark-ready and not release-ready. It is being cleaned into a publishable exploratory state: enough structure to navigate, enough documentation to understand the plan, and little enough abstraction that the actual inference mechanics remain visible.
+The runtime loads and runs real GGUF models (Devstral Small 22B Q8_0 verified). The inference path is complete: GGUF mmap, Q8_0 dequant, tokenizer, KV cache, RoPE, GQA attention, SwiGLU FFN, logit sampling with repetition penalty. The GPU kernel achieves 57 GB/s effective bandwidth (84% of M1 base peak) in isolation.
+
+End-to-end decode speed is well below llama.cpp. Three reasons, ranked by impact:
+
+**1. 280 serial GPU round-trips per token.** Each of the 280 matmuls (40 layers × 7 weights) gets its own command buffer: encode → commit → `waitUntilCompleted`. That last call blocks the CPU until the GPU finishes. Then the CPU does a small amount of work (RMSNorm, RoPE, attention) and submits the next job. The GPU sits idle during all that CPU work. The GPU is being fed one small job at a time instead of a continuous stream.
+
+**2. Temporary Metal buffer allocation per dispatch.** `buf_zeros(n)` allocates a new Metal buffer for every matmul output — that is a kernel trap into the IOKit GPU subsystem per call, plus teardown when it is dropped. This happens 280 times per token.
+
+**3. The kernel does not use Apple's hardware matrix units.** The kernel does scalar float arithmetic in a loop. Apple Silicon has dedicated `simdgroup_matrix_multiply` instructions (8×8 hardware tiles) that llama.cpp exploits. These get far higher throughput per clock than scalar ops.
+
+The core problem is #1. The isolated GPU benchmark (synthetic buffers, no CPU round-trips) measured 57 GB/s — 84% of M1 peak. The kernel itself is fine once it is running. The GPU is just idle most of the time waiting for the CPU to issue the next job. Batching a full layer into one command buffer and keeping the GPU fed improves speed dramatically before touching the kernel at all.
 
 Old CUDA/YALM notes and early inference sketches live in `docs/notes/`. They are references, not active implementation.
